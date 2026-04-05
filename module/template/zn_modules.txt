@@ -1,1 +1,1 @@
-name=adbd companion lib/lib${moduleId}.so
+name=audiohalservice.qti companion lib/lib${moduleId}.so

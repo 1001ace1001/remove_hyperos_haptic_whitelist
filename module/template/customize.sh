@@ -55,12 +55,16 @@ extract "$ZIPFILE" 'sepolicy.rule' "$TMPDIR"
 
 ui_print "- Extracting module files"
 extract "$ZIPFILE" 'module.prop'     "$MODPATH"
-extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
-extract "$ZIPFILE" 'service.sh'      "$MODPATH"
 extract "$ZIPFILE" 'zn_modules.txt'  "$MODPATH"
+extract "$ZIPFILE" 'uninstall.sh'    "$MODPATH"
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
 mkdir "$MODPATH/lib"
 
 ui_print "- Extracting $ARCH libraries"
 extract "$ZIPFILE" "lib/$ARCH/lib$SONAME.so" "$MODPATH/lib" true
+
+if [ ! -f "/data/adb/hyperos_music_haptic_whitelist.txt" ]; then
+  ui_print "- Create configuration file"
+  extract "$ZIPFILE" "hyperos_music_haptic_whitelist.txt" "/data/adb"
+fi
