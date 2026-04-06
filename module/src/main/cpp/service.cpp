@@ -3,45 +3,68 @@
 #include <vector>
 #include <thread>
 #include <shared_mutex>
+#include <unordered_set>
 
 #include "log.h"
 #include "zygisk_next_api.h"
 
-#define IS_A2H_APP_NAME_LIST_SYMBOL "_ZN3qti5audio4core21isA2HAppNameListAllowENSt3__16vectorINS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS7_IS9_EEEE.cfi"
 #define IS_A2H_MUSIC_APP_SYMBOL "_ZN3qti5audio4core13isA2HMusicAppENSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE.cfi"
 
 static ZygiskNextAPI api_table;
-std::shared_mutex g_whitelist_mutex;
-std::vector<std::string> g_packages_whitelist;
+std::shared_mutex pointer_swap_lock;
+std::unordered_set<std::string> *g_packages_whitelist = nullptr;
 
-static bool my_isA2HAppNameListAllow(const std::vector<std::string>& appNameList) {
-    std::shared_lock lock(g_whitelist_mutex);
+static bool AnalyzeA2HMusicAppWhiteListAddress(void *isA2HMusicApp_addr) {
+    void *a2h_music_app_whitelist_address = nullptr;
 
-    if (g_packages_whitelist.empty()) {
+    auto *func_ptr = static_cast<uint32_t *>(isA2HMusicApp_addr);
+    if (func_ptr == nullptr) {
         return false;
     }
 
-    for (const auto& app : appNameList) {
-        auto it = std::find(g_packages_whitelist.begin(), g_packages_whitelist.end(), app);
-        if (it != g_packages_whitelist.end()) {
-            LOGI("my_isA2HAppNameListAllow: allow %s", app.c_str());
-            return true;
+    LOGI("Start searching A2HMusicAppWhiteListAddress");
+
+    for (int i = 0; i < 30; i++) {
+        const uint32_t inst = func_ptr[i];
+
+        if ((inst & 0x9F000000) == 0x10000000) { // search ADR
+            LOGI("ADR searched");
+
+            const uint32_t *pc = &func_ptr[i];
+
+            const uint32_t immlo = (inst >> 29) & 0x3U;
+            const uint32_t immhi = (inst >> 5) & 0x7FFFFU;
+
+            auto imm21 = static_cast<int32_t>((immhi << 2) | immlo);
+
+            if ((imm21 & 0x100000) != 0) {
+                imm21 |= static_cast<int32_t>(0xFFE00000);
+            }
+
+            a2h_music_app_whitelist_address = reinterpret_cast<void **>(
+                    reinterpret_cast<uintptr_t>(pc) + static_cast<uintptr_t>(imm21)
+            );
+
+            LOGI("whitelist_address: %p", a2h_music_app_whitelist_address);
+            break;
         }
     }
 
-    return false;
-}
+    if (a2h_music_app_whitelist_address != nullptr) {
+        pointer_swap_lock.lock();
+        std::unordered_set<std::string> *old_whitelist = nullptr;
+        old_whitelist = g_packages_whitelist;
+        g_packages_whitelist = reinterpret_cast<std::unordered_set<std::string> *>(a2h_music_app_whitelist_address);
 
-static bool my_isA2HMusicApp(const std::string& appName) {
-    std::shared_lock lock(g_whitelist_mutex);
+        if (old_whitelist != nullptr) {
+            *g_packages_whitelist = std::move(*old_whitelist);
+            delete old_whitelist;
+        }
+        pointer_swap_lock.unlock();
 
-    auto it = std::find(g_packages_whitelist.begin(), g_packages_whitelist.end(), appName);
-    if (it != g_packages_whitelist.end()) {
-        LOGI("my_isA2HMusicApp: allow %s", appName.c_str());
         return true;
     }
 
-    LOGI("my_isA2HMusicApp: deny %s", appName.c_str());
     return false;
 }
 
@@ -56,24 +79,12 @@ static void* my_do_dlopen(const char* name, int flags, const void* extinfo, cons
 
         auto resolver = api_table.newSymbolResolver(name, nullptr);
         if (resolver) {
-            auto addr = api_table.symbolLookup(resolver, IS_A2H_APP_NAME_LIST_SYMBOL, false, nullptr);
+            auto addr = api_table.symbolLookup(resolver, IS_A2H_MUSIC_APP_SYMBOL, false, nullptr);
 
-            if (api_table.inlineHook(addr,
-                                  (void*)my_isA2HAppNameListAllow,
-                                  nullptr) == ZN_SUCCESS) {
-                LOGI("Inline hook A2H AppName List SUCCESS");
+            if (AnalyzeA2HMusicAppWhiteListAddress(addr)) {
+                LOGI("A2H MusicApp Whitelist Address found!");
             } else {
-                LOGE("Inline hook A2H AppName List FAILED");
-            }
-
-            addr = api_table.symbolLookup(resolver, IS_A2H_MUSIC_APP_SYMBOL, false, nullptr);
-
-            if (api_table.inlineHook(addr,
-                                  (void*)my_isA2HMusicApp,
-                                  nullptr) == ZN_SUCCESS) {
-                LOGI("Inline hook A2H Music App Check SUCCESS");
-            } else {
-                LOGE("Inline hook A2H Music App Check FAILED");
+                LOGE("A2H MusicApp WhiteList Address search FAILED!");
             }
 
             api_table.freeSymbolResolver(resolver);
@@ -115,21 +126,31 @@ void start_rpc_receiver(int fd) {
                     total_read += curr;
                 }
 
-                std::vector<std::string> new_list;
+                std::unordered_set<std::string> new_list;
                 char* saveptr;
                 char* line = strtok_r(&buffer[0], "\n", &saveptr);
+
                 while (line != nullptr) {
                     size_t len = strlen(line);
-                    if (len > 0 && line[len-1] == '\r') line[len-1] = '\0';
+                    if (len > 0 && line[len - 1] == '\r') {
+                        line[len - 1] = '\0';
+                    }
 
-                    if (strlen(line) > 0) {
-                        new_list.emplace_back(line);
+                    if (line[0] != '\0') {
+                        new_list.insert(std::string(line));
                     }
                     line = strtok_r(nullptr, "\n", &saveptr);
                 }
 
-                std::unique_lock lock(g_whitelist_mutex);
-                g_packages_whitelist = std::move(new_list);
+                if (g_packages_whitelist == nullptr) {
+                    pointer_swap_lock.lock();
+                    g_packages_whitelist = new std::unordered_set<std::string>();
+                    *g_packages_whitelist = std::move(new_list);
+                    pointer_swap_lock.unlock();
+                } else {
+                    *g_packages_whitelist = std::move(new_list);
+                }
+
                 LOGI("whitelist updated");
             }
         }
